@@ -2328,8 +2328,6 @@
   tcpm_tcpc_reset
   tcpm_unregister_port
   tcpm_vbus_change
-  teo_cpu_get_util_threshold
-  teo_cpu_set_util_threshold
   thermal_cdev_update
   thermal_cooling_device_register
   thermal_cooling_device_unregister
