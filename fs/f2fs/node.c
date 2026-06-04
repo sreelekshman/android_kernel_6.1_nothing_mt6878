@@ -799,6 +799,16 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 	for (i = 1; i <= level; i++) {
 		bool done = false;
 
+		if (nids[i] && nids[i] == dn->inode->i_ino) {
+			err = -EFSCORRUPTED;
+			f2fs_err(sbi,
+				"inode mapping table is corrupted, run fsck to fix it, "
+				"ino:%lu, nid:%u, level:%d, offset:%d",
+				dn->inode->i_ino, nids[i], level, offset[level]);
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			goto release_pages;
+		}
+
 		if (!nids[i] && mode == ALLOC_NODE) {
 			/* alloc new node */
 			if (!f2fs_alloc_nid(sbi, &(nids[i]))) {
@@ -1608,6 +1618,7 @@ static int __write_node_page(struct page *page, bool atomic, bool *submitted,
 		.io_type = io_type,
 		.io_wbc = wbc,
 	};
+	struct f2fs_lock_context lc;
 	unsigned int seq;
 
 	trace_f2fs_writepage(page, NODE);
@@ -1635,17 +1646,17 @@ static int __write_node_page(struct page *page, bool atomic, bool *submitted,
 		goto redirty_out;
 
 	if (wbc->for_reclaim) {
-		if (!f2fs_down_read_trylock(&sbi->node_write))
+		if (!f2fs_down_read_trylock_trace(&sbi->node_write, &lc))
 			goto redirty_out;
 	} else {
-		f2fs_down_read(&sbi->node_write);
+		f2fs_down_read_trace(&sbi->node_write, &lc);
 	}
 
 	/* This page is already truncated */
 	if (unlikely(ni.blk_addr == NULL_ADDR)) {
 		ClearPageUptodate(page);
 		dec_page_count(sbi, F2FS_DIRTY_NODES);
-		f2fs_up_read(&sbi->node_write);
+		f2fs_up_read_trace(&sbi->node_write, &lc);
 		unlock_page(page);
 		return 0;
 	}
@@ -1653,7 +1664,7 @@ static int __write_node_page(struct page *page, bool atomic, bool *submitted,
 	if (__is_valid_data_blkaddr(ni.blk_addr) &&
 		!f2fs_is_valid_blkaddr(sbi, ni.blk_addr,
 					DATA_GENERIC_ENHANCE)) {
-		f2fs_up_read(&sbi->node_write);
+		f2fs_up_read_trace(&sbi->node_write, &lc);
 		goto redirty_out;
 	}
 
@@ -1673,7 +1684,7 @@ static int __write_node_page(struct page *page, bool atomic, bool *submitted,
 	f2fs_do_write_node_page(nid, &fio);
 	set_node_addr(sbi, &ni, fio.new_blkaddr, is_fsync_dnode(page));
 	dec_page_count(sbi, F2FS_DIRTY_NODES);
-	f2fs_up_read(&sbi->node_write);
+	f2fs_up_read_trace(&sbi->node_write, &lc);
 
 	if (wbc->for_reclaim) {
 		f2fs_submit_merged_write_cond(sbi, NULL, page, 0, NODE);

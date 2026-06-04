@@ -19,8 +19,6 @@
 #include <linux/sched/stat.h>
 #include <linux/math64.h>
 
-#include "gov.h"
-
 #define BUCKETS 12
 #define INTERVAL_SHIFT 3
 #define INTERVALS (1UL << INTERVAL_SHIFT)
@@ -160,6 +158,14 @@ static inline int performance_multiplier(unsigned int nr_iowaiters)
 
 static DEFINE_PER_CPU(struct menu_device, menu_devices);
 
+static void menu_update_intervals(struct menu_device *data, unsigned int interval_us)
+{
+	/* Update the repeating-pattern data. */
+	data->intervals[data->interval_ptr++] = interval_us;
+	if (data->interval_ptr >= INTERVALS)
+		data->interval_ptr = 0;
+}
+
 static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev);
 
 /*
@@ -168,7 +174,8 @@ static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev);
  * of points is below a threshold. If it is... then use the
  * average of these 8 points as the estimated value.
  */
-static unsigned int get_typical_interval(struct menu_device *data)
+static unsigned int get_typical_interval(struct menu_device *data,
+					 unsigned int predicted_us)
 {
 	int i, divisor;
 	unsigned int min, max, thresh, avg;
@@ -196,7 +203,11 @@ again:
 		}
 	}
 
-	if (!max)
+	/*
+	 * If the result of the computation is going to be discarded anyway,
+	 * avoid the computation altogether.
+	 */
+	if (min >= predicted_us)
 		return UINT_MAX;
 
 	if (divisor == INTERVALS)
@@ -245,20 +256,17 @@ again:
 	 *
 	 * This can deal with workloads that have long pauses interspersed
 	 * with sporadic activity with a bunch of short pauses.
+	 *
+	 * However, if the number of remaining samples is too small to exclude
+	 * any more outliers, allow the deepest available idle state to be
+	 * selected because there are systems where the time spent by CPUs in
+	 * deep idle states is correlated to the maximum frequency the CPUs
+	 * can get to.  On those systems, shallow idle states should be avoided
+	 * unless there is a clear indication that the given CPU is most likley
+	 * going to be woken up shortly.
 	 */
-	if (divisor * 4 <= INTERVALS * 3) {
-		/*
-		 * If there are sufficiently many data points still under
-		 * consideration after the outliers have been eliminated,
-		 * returning without a prediction would be a mistake because it
-		 * is likely that the next interval will not exceed the current
-		 * maximum, so return the latter in that case.
-		 */
-		if (divisor >= INTERVALS / 2)
-			return max;
-
+	if (divisor * 4 <= INTERVALS * 3)
 		return UINT_MAX;
-	}
 
 	thresh = max - 1;
 	goto again;
@@ -275,6 +283,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 {
 	struct menu_device *data = this_cpu_ptr(&menu_devices);
 	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
+	unsigned int predicted_us;
 	u64 predicted_ns;
 	u64 interactivity_req;
 	unsigned int nr_iowaiters;
@@ -284,43 +293,26 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	if (data->needs_update) {
 		menu_update(drv, dev);
 		data->needs_update = 0;
+	} else if (!dev->last_residency_ns) {
+		/*
+		 * This happens when the driver rejects the previously selected
+		 * idle state and returns an error, so update the recent
+		 * intervals table to prevent invalid information from being
+		 * used going forward.
+		 */
+		menu_update_intervals(data, UINT_MAX);
 	}
+
+	/* determine the expected residency time, round up */
+	delta = tick_nohz_get_sleep_length(&delta_tick);
+	if (unlikely(delta < 0)) {
+		delta = 0;
+		delta_tick = 0;
+	}
+	data->next_timer_ns = delta;
 
 	nr_iowaiters = nr_iowait_cpu(dev->cpu);
-
-	/* Find the shortest expected idle interval. */
-	predicted_ns = get_typical_interval(data) * NSEC_PER_USEC;
-	if (predicted_ns > RESIDENCY_THRESHOLD_NS) {
-		unsigned int timer_us;
-
-		/* Determine the time till the closest timer. */
-		delta = tick_nohz_get_sleep_length(&delta_tick);
-		if (unlikely(delta < 0)) {
-			delta = 0;
-			delta_tick = 0;
-		}
-
-		data->next_timer_ns = delta;
-		data->bucket = which_bucket(data->next_timer_ns, nr_iowaiters);
-
-		/* Round up the result for half microseconds. */
-		timer_us = div_u64((RESOLUTION * DECAY * NSEC_PER_USEC) / 2 +
-					data->next_timer_ns *
-						data->correction_factor[data->bucket],
-				   RESOLUTION * DECAY * NSEC_PER_USEC);
-		/* Use the lowest expected idle interval to pick the idle state. */
-		predicted_ns = min((u64)timer_us * NSEC_PER_USEC, predicted_ns);
-	} else {
-		/*
-		 * Because the next timer event is not going to be determined
-		 * in this case, assume that without the tick the closest timer
-		 * will be in distant future and that the closest tick will occur
-		 * after 1/2 of the tick period.
-		 */
-		data->next_timer_ns = KTIME_MAX;
-		delta_tick = TICK_NSEC / 2;
-		data->bucket = which_bucket(KTIME_MAX, nr_iowaiters);
-	}
+	data->bucket = which_bucket(data->next_timer_ns, nr_iowaiters);
 
 	if (unlikely(drv->state_count <= 1 || latency_req == 0) ||
 	    ((data->next_timer_ns < drv->states[1].target_residency_ns ||
@@ -334,6 +326,16 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		*stop_tick = !(drv->states[0].flags & CPUIDLE_FLAG_POLLING);
 		return 0;
 	}
+
+	/* Round up the result for half microseconds. */
+	predicted_us = div_u64(data->next_timer_ns *
+			       data->correction_factor[data->bucket] +
+			       (RESOLUTION * DECAY * NSEC_PER_USEC) / 2,
+			       RESOLUTION * DECAY * NSEC_PER_USEC);
+	/* Use the lowest expected idle interval to pick the idle state. */
+	predicted_ns = (u64)min(predicted_us,
+				get_typical_interval(data, predicted_us)) *
+				NSEC_PER_USEC;
 
 	if (tick_nohz_tick_stopped()) {
 		/*
@@ -553,10 +555,7 @@ static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 
 	data->correction_factor[data->bucket] = new_factor;
 
-	/* update the repeating-pattern data */
-	data->intervals[data->interval_ptr++] = ktime_to_us(measured_ns);
-	if (data->interval_ptr >= INTERVALS)
-		data->interval_ptr = 0;
+	menu_update_intervals(data, ktime_to_us(measured_ns));
 }
 
 /**
